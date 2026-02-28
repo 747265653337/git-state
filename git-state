@@ -1,0 +1,237 @@
+#!/bin/sh
+# git-state - get the state of repos at a given path
+# POSIX-compliant
+
+set -eu
+
+GREEN='\033[0;32m'
+ORANGE='\033[0;33m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+usage() {
+    cat <<EOF
+git-state - get the state of repos at a given path
+
+Usage: git-state [-abruh] [-f state] [-l level] [path]
+
+Options:
+  -a         All: show all repositories, including clean ones
+  -b         Basename: show just the repository name
+  -l LEVEL   Level: limit search depth to LEVEL
+  -f STATE   Filter: filter by any char in STATE string (? + M v ^ -)
+  -r         Raw: print repository paths only, respects -b 
+  -u         Update: fetch from remote before checking state
+  -h         Print this help message
+
+State legend:
+  Local:   ? untracked   + new file   M modified
+  Remote:  v unpulled    ^ unpushed   -- no upstream
+EOF
+}
+
+# Resolve path without readlink -f (for macOS/BSD compat)
+resolve_path() {
+    _target="${1:-.}"
+    if [ -d "$_target" ]; then
+        ( cd "$_target" && pwd )
+    else
+        echo "Error: '$_target' is not a directory." >&2
+        exit 1
+    fi
+}
+
+list_repos() {
+    _root="$1"
+    _level="$2"
+    if [ -n "$_level" ]; then
+        find -L "$_root" -maxdepth "$_level" -type d -name ".git"
+    else
+        find -L "$_root" -type d -name ".git"
+    fi | while IFS= read -r _git_dir; do
+        dirname "$_git_dir"
+    done | sort
+}
+
+summarize_repo() {
+    _repo="$1"
+    _update="$2"
+    _all="$3"
+    _basename_only="$4"
+    _raw="$5"
+    _filter="$6"
+
+    if [ "$_basename_only" -eq 1 ]; then
+        _display=$(basename "$_repo")
+    else
+        _display="$_repo"
+    fi
+
+    # Truncation
+    _maxlen=40
+    if [ "$_raw" -eq 0 ]; then
+        _displen=$(printf '%s' "$_display" | wc -c)
+        if [ "$_displen" -gt "$_maxlen" ]; then
+            _display="...$(printf '%s' "$_display" | rev | cut -c1-$(( _maxlen - 3 )) | rev)"
+        fi
+    fi
+
+    _branch=$(git -C "$_repo" symbolic-ref --short HEAD 2>/dev/null || echo "(detached)")
+
+    # Remote state
+    _has_upstream=$(git -C "$_repo" rev-list --count  "@{u}.." 2>/dev/null || echo "-1")
+    if [ "$_has_upstream" -ne -1 ]; then
+        if [ "$_update" -eq 1 ]; then 
+            git -C "$_repo" fetch -q 2>/dev/null || true
+        fi
+        _behind=$(git -C "$_repo" rev-list --count "..@{u}" 2>/dev/null || echo "0")
+        _ahead=${_has_upstream}
+        if [ "$_behind" -gt 0 ]; then _rstate="v"; else _rstate=" "; fi
+        if [ "$_ahead"  -gt 0 ]; then _rstate="${_rstate}^"; else _rstate="${_rstate} "; fi
+    else
+        _rstate="--"
+    fi
+
+    # Local state
+    _status=$(LC_ALL=C git -C "$_repo" status --porcelain 2>/dev/null)
+    _lstate=$(printf '%s\n' "$_status" | awk '
+        /^\?\?/             { u=1 }
+        /^A /               { n=1 }
+        /^[MRDC]|^.[MRDC]/  { m=1 }
+        END { printf "%s%s%s", (u ? "?" : " "), (n ? "+" : " "), (m ? "M" : " ") }
+    ')
+
+    _combined="${_lstate}${_rstate}"
+
+    # Format 
+    _has_change=$(printf '%s' "$_lstate $_rstate" | tr -d ' -' | wc -c)
+    _has_change=$(( _has_change + 0 ))
+
+    # Filter
+    if [ -n "$_filter" ]; then
+        _match=0
+        _i=1
+        _flen=$(printf '%s' "$_filter" | wc -c)
+        while [ "$_i" -le "$_flen" ]; do
+            _char=$(printf '%s' "$_filter" | cut -c"$_i")
+            case "$_combined" in
+                *"$_char"*) _match=1; break ;;
+            esac
+            _i=$(( _i + 1 ))
+        done
+        if [ "$_match" -eq 0 ]; then
+            return 0
+        fi
+    fi
+
+    if [ "$_has_change" -eq 0 ]; then
+        if [ "$_all" -eq 0 ]; then
+            return 0
+        fi
+        _color="$GREEN"
+    elif [ "$_lstate" = "   " ]; then
+        _color="$ORANGE"
+    else
+        _color="$RED"
+    fi
+
+    if [ "$_raw" -eq 1 ]; then
+        printf '%s\n' "$_display"
+    else
+        printf '%b%-40s  %-20s  %s%b\n' "$_color" "$_display" "$_branch" "$_combined" "$NC"
+    fi
+    return 1  # indicate print 
+}
+
+main() {
+    #Options
+    _update=0
+    _level=""
+    _all=0
+    _basename_only=0
+    _raw=0
+    _filter=""
+
+    while getopts "habruf:l:" _opt; do
+        case "$_opt" in
+            h) usage; exit 0 ;;
+            a) _all=1 ;;
+            b) _basename_only=1 ;;
+            f) _filter="$OPTARG" ;;
+            l) _level="$OPTARG" ;;
+            r) _raw=1 ;;
+            u) _update=1 ;;
+            *) usage; exit 1 ;;
+        esac
+    done
+
+    if [ -n "$_level" ]; then
+        case "$_level" in
+            *[!0-9]*) echo "Error: -l requires a positive integer." >&2; exit 1 ;;
+        esac
+    fi
+
+    if [ -n "$_filter" ]; then
+        _invalid=$(printf '%s' "$_filter" | tr -d '?+Mv^-')
+        if [ -n "$_invalid" ]; then
+            echo "Error: invalid filter characters '$_invalid'. Valid characters: ? + M v ^ -" >&2
+            exit 1
+        fi
+    fi
+    shift $((OPTIND - 1))
+
+    # find repos
+    _target=$(resolve_path "${1:-}")
+
+    _total=0
+    _dirty=0
+
+    _tmpfile=$(mktemp)
+    list_repos "$_target" "$_level" > "$_tmpfile"
+
+    if [ ! -s "$_tmpfile" ]; then
+        rm -f "$_tmpfile"
+        echo "No git repositories found under '$_target'."
+        exit 0
+    fi
+
+    # Header 
+    _divider=$(printf '%0.s=' $(seq 1 40); printf '  '; printf '%0.s=' $(seq 1 20); printf '  '; printf '%0.s=' $(seq 1 5))
+    if [ "$_raw" -eq 0 ]; then
+        printf "\n%-40s  %-20s  %s\n" "Repository" "Branch" "State"
+        printf '%s\n' "$_divider"
+    fi
+
+    # Parallelism 
+    if [ "$_update" -eq 1 ]; then
+        while IFS= read -r _repo; do
+            _total=$(( _total + 1 ))
+            summarize_repo "$_repo" "$_update" "$_all" "$_basename_only" "$_raw" "$_filter" &
+        done < "$_tmpfile"
+        wait
+    else # Sequential
+        while IFS= read -r _repo; do
+            _total=$(( _total + 1 ))
+            if ! summarize_repo "$_repo" "$_update" "$_all" "$_basename_only" "$_raw" "$_filter"; then
+                _dirty=$(( _dirty + 1 ))
+            fi
+        done < "$_tmpfile"
+    fi
+    rm -f "$_tmpfile"
+
+    # Conclusion
+    if [ "$_raw" -eq 0 ]; then
+        printf '%b' "$NC"
+        printf '%s\n' "$_divider" 
+        if [ "$_update" -eq 1 ]; then
+            printf "%d repositories checked\n" "$_total"
+        else
+            printf "%d/%d repositories shown\n" "$_dirty" "$_total"
+        fi
+    fi
+}
+
+# restore colour
+trap 'printf "%b" "$NC"' EXIT INT TERM
+
+main "$@"
