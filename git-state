@@ -19,7 +19,7 @@ Options:
   -a         All: show all repositories, including clean ones
   -b         Basename: show just the repository name
   -l LEVEL   Level: limit search depth to LEVEL
-  -f STATE   Filter: filter by any char in STATE string (? + M v ^ -)
+  -f STATE   Filter: filter by any char in STATE string (? + M v ^ -), implies -a
   -r         Raw: print repository paths only, respects -b 
   -u         Update: fetch from remote before checking state
   -h         Print this help message
@@ -157,7 +157,7 @@ main() {
             h) usage; exit 0 ;;
             a) _all=1 ;;
             b) _basename_only=1 ;;
-            f) _filter="$OPTARG" ;;
+            f) _filter="$OPTARG" ; _all=1;;
             l) _level="$OPTARG" ;;
             r) _raw=1 ;;
             u) _update=1 ;;
